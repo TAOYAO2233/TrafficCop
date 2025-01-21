@@ -380,54 +380,89 @@ get_traffic_usage() {
     local start_date=$(get_period_start_date)
     local end_date=$(get_period_end_date)
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 周期开始日期: $start_date, 周期结束日期: $end_date" >&2
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 获取流量统计中..." >&2
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 统计周期: $start_date 到 $end_date" >&2
     
-    local vnstat_output=$(vnstat -i $MAIN_INTERFACE --begin "$start_date" --end "$end_date" --oneline b)
-    # echo "vnstat输出: $vnstat_output" >&2
+    # Ensure vnstat database is up to date
+    vnstat -u -i $MAIN_INTERFACE >&2
     
-    local usage
+    # Get vnstat output with error checking
+    local vnstat_output
+    vnstat_output=$(vnstat -i $MAIN_INTERFACE --begin "$start_date" --end "$end_date" --oneline b 2>&2)
+    if [ $? -ne 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 命令执行失败" >&2
+        return 1
+    fi
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat原始输出: $vnstat_output" >&2
+    
+    local usage=0
     case $TRAFFIC_MODE in
         out)
-            usage=$(echo "$vnstat_output" | cut -d';' -f10)
+            usage=$(echo "$vnstat_output" | awk -F';' '{print $10}')
             ;;
         in)
-            usage=$(echo "$vnstat_output" | cut -d';' -f9)
+            usage=$(echo "$vnstat_output" | awk -F';' '{print $9}')
             ;;
         total)
-            usage=$(echo "$vnstat_output" | cut -d';' -f11)
+            usage=$(echo "$vnstat_output" | awk -F';' '{print $11}')
             ;;
         max)
-            local rx=$(echo "$vnstat_output" | cut -d';' -f9)
-            local tx=$(echo "$vnstat_output" | cut -d';' -f10)
-            usage=$(echo "$rx $tx" | tr ' ' '\n' | sort -rn | head -n1)
+            local rx=$(echo "$vnstat_output" | awk -F';' '{print $9}')
+            local tx=$(echo "$vnstat_output" | awk -F';' '{print $10}')
+            usage=$(echo -e "$rx\n$tx" | sort -rn | head -n1)
             ;;
     esac
 
-    # echo "用量字节数: $usage" >&2
-    if [ -n "$usage" ]; then
-        # 将字节转换为 GiB，并确保结果至少有一位小数
-        usage=$(echo "scale=3; x=$usage/1024/1024/1024; if(x<1) print 0; x" | bc)
-        # echo "将字节转换为 GiB: $usage" >&2
-        echo $usage
-    else
-        # echo "无法获取用量字节数" >&2
+    # Better error handling for empty or invalid values
+    if [ -z "$usage" ] || [ "$usage" = "0" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 警告: 获取到空的流量数据" >&2
         echo "0.000"
+        return 1
     fi
+
+    # Convert bytes to GB with proper error handling
+    local gb_usage
+    gb_usage=$(echo "scale=3; $usage/1024/1024/1024" | bc 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$gb_usage" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 警告: 流量单位转换失败" >&2
+        echo "0.000"
+        return 1
+    fi
+
+    echo $gb_usage
 }
 
-
-# 修改 check_and_limit_traffic 函数
+# Modified check_and_limit_traffic function with better error handling
 check_and_limit_traffic() {
-    local current_usage=$(get_traffic_usage)
-    local limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc)
+    local current_usage
+    current_usage=$(get_traffic_usage)
+    if [ $? -ne 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: 无法获取当前流量使用情况" | tee -a "$LOG_FILE"
+        return 1
+    }
+
+    # Ensure values are valid numbers
+    if ! [[ "$current_usage" =~ ^[0-9]+\.?[0-9]*$ ]] || ! [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+\.?[0-9]*$ ]] || ! [[ "$TRAFFIC_TOLERANCE" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: 无效的数值" | tee -a "$LOG_FILE"
+        return 1
+    }
+
+    local limit_threshold
+    limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc)
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage GB，限制流量: $limit_threshold GB" | tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage GB，限制阈值: $limit_threshold GB" | tee -a "$LOG_FILE"
     
     if (( $(echo "$current_usage > $limit_threshold" | bc -l) )); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制" | tee -a "$LOG_FILE"
         if [ "$LIMIT_MODE" = "tc" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
-            tc qdisc add dev $MAIN_INTERFACE root tbf rate ${LIMIT_SPEED}kbit burst 32kbit latency 400ms
+            # Clear existing tc rules first
+            tc qdisc del dev $MAIN_INTERFACE root 2>/dev/null
+            if tc qdisc add dev $MAIN_INTERFACE root tbf rate ${LIMIT_SPEED}kbit burst 32kbit latency 400ms; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速已启用" | tee -a "$LOG_FILE"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速设置失败" | tee -a "$LOG_FILE"
+            fi
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
             shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"
@@ -435,7 +470,7 @@ check_and_limit_traffic() {
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，清除所有限制" | tee -a "$LOG_FILE"
         tc qdisc del dev $MAIN_INTERFACE root 2>/dev/null
-        shutdown -c 2>/dev/null  # 取消可能存在的关机计划
+        shutdown -c 2>/dev/null
     fi
 }
 
